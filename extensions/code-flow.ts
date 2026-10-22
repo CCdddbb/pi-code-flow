@@ -44,12 +44,6 @@ interface FlowState {
 const EMPTY_STATE: FlowState = { phase: "idle", runs: [] };
 const STATUS_KEY = "code-flow";
 
-// Long prompt-cache retention. Children inherit this environment variable, and
-// the default short retention expires while a pipeline child is still working,
-// which turns the parent's next turn into a full-price re-send. Set once, before
-// any request; an explicit value from the operator always wins.
-if (!process.env.PI_CACHE_RETENTION) process.env.PI_CACHE_RETENTION = "long";
-
 interface SessionUsage {
   input?: number;
   cacheRead?: number;
@@ -140,7 +134,11 @@ function pct(part: number, whole: number): string {
  * show. Counted per assistant message so a session that mostly re-sends cached
  * history scores high and a session made of cold starts scores low.
  */
-function collectCacheStats(cwd: string): { files: { name: string; stat: CacheStat }[]; total: CacheStat } {
+function collectCacheStats(cwd: string): {
+  files: { name: string; stat: CacheStat }[];
+  total: CacheStat;
+  byProvider: { key: string; stat: CacheStat }[];
+} {
   const dir = sessionsDir(cwd);
   let names: string[] = [];
   try {
@@ -150,6 +148,7 @@ function collectCacheStats(cwd: string): { files: { name: string; stat: CacheSta
   }
 
   const files: { name: string; stat: CacheStat }[] = [];
+  const providers = new Map<string, CacheStat>();
   for (const name of names) {
     const stat: CacheStat = { ...EMPTY_CACHE_STAT };
     let raw = "";
@@ -160,7 +159,10 @@ function collectCacheStats(cwd: string): { files: { name: string; stat: CacheSta
     }
     for (const line of raw.split("\n")) {
       if (!line) continue;
-      let entry: { type?: string; message?: { role?: string; usage?: SessionUsage } };
+      let entry: {
+        type?: string;
+        message?: { role?: string; provider?: string; model?: string; usage?: SessionUsage };
+      };
       try {
         entry = JSON.parse(line) as typeof entry;
       } catch {
@@ -175,6 +177,15 @@ function collectCacheStats(cwd: string): { files: { name: string; stat: CacheSta
       stat.read += usage.cacheRead || 0;
       stat.write += usage.cacheWrite || 0;
       stat.input += usage.input || 0;
+
+      const key = `${entry.message.provider || "?"}/${entry.message.model || "?"}`;
+      const bucket = providers.get(key) ?? { ...EMPTY_CACHE_STAT };
+      bucket.turns += 1;
+      bucket.prompt += prompt;
+      bucket.read += usage.cacheRead || 0;
+      bucket.write += usage.cacheWrite || 0;
+      bucket.input += usage.input || 0;
+      providers.set(key, bucket);
     }
     if (stat.turns > 0) files.push({ name, stat });
   }
@@ -190,11 +201,16 @@ function collectCacheStats(cwd: string): { files: { name: string; stat: CacheSta
     { ...EMPTY_CACHE_STAT },
   );
 
-  return { files, total };
+  // Worst offenders first: uncached input is what you actually paid full price for.
+  const byProvider = [...providers.entries()]
+    .map(([key, stat]) => ({ key, stat }))
+    .sort((a, b) => b.stat.input - a.stat.input);
+
+  return { files, total, byProvider };
 }
 
 function statsText(cwd: string): string {
-  const { files, total } = collectCacheStats(cwd);
+  const { files, total, byProvider } = collectCacheStats(cwd);
   if (files.length === 0) {
     return [
       "本项目还没有可统计的会话记录。",
@@ -209,8 +225,14 @@ function statsText(cwd: string): string {
     `cache write:    ${total.write.toLocaleString()}`,
     `turns:          ${total.turns.toLocaleString()}`,
     "",
-    "最近会话：",
+    "按 provider 拆（未缓存 input 降序）——混着看会得出错误结论：",
   ];
+  for (const { key, stat } of byProvider.slice(0, 6)) {
+    lines.push(
+      `  ${key.padEnd(34)} hit ${pct(stat.read, stat.prompt).padStart(6)}  uncached ${stat.input.toLocaleString()}`,
+    );
+  }
+  lines.push("", "最近会话：");
   for (const file of files.slice(-5).reverse()) {
     const short = file.name.replace(/^.*_/, "").replace(/\.jsonl$/, "").slice(0, 8);
     lines.push(
@@ -219,9 +241,9 @@ function statsText(cwd: string): string {
   }
   lines.push(
     "",
-    "判读：命中率是会话长度的函数，不是提示词写法的函数。本机实测",
-    "第1轮 9.5% / 2-4轮 42% / 5-9轮 77% / 10-29轮 87% / 30+轮 91%。",
-    "短会话多、每个都从冷前缀开始，就是命中率低的主因。",
+    "判读：codex 类 provider 的命中率随会话长度上升（本机实测第1轮 0% /",
+    "2-4轮 45% / 5-9轮 82% / 10-29轮 95% / 30+轮 97%）；codebuddy 那类",
+    "恒定 ~49%，与轮次无关，改提示词或编排都动不了它。",
   );
   return lines.join("\n");
 }
