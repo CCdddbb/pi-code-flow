@@ -49,6 +49,15 @@
 
 自查：`/flow stats` 用和 cc-switch 同一口径（`cacheRead / (input + cacheRead + cacheWrite)`）统计本项目主会话，并打印上面的分轮曲线做对照。注意它只统计主会话，且不区分 provider。
 
+要单独查 codebuddy，用 `node tools/cb-cache-audit.mjs`：它只读 pi 会话、codebuddy 会话文件和 `codebuddy-sdk.log`，不写任何配置、不碰 provider、对 codex 零影响。
+
+它的输出能定位到两个不同的病：
+
+- **行随轮次上升** → 冷启动成本，编排可以改（本节讲的就是这个）。
+- **行完全平**（codebuddy 就是这种，第 1 轮 47.5%、30+ 轮 49.1%）→ 与会话长度无关，改提示词或编排都没用。它还同时满足 `uncached / cacheRead ≈ 1.0` 且 `cacheWrite ≈ 0`，而 codex 同一指标是 0.03——即 codebuddy 每轮有一半内容永远不被缓存，也从不写缓存。
+
+后一种情况唯一能定性的是**每请求日志**：`CODEBUDDY_SDK_DEBUG=1 pi` 跑一轮，日志里会带 `cachePct=` 和 `syncResult: path=reuse|rebuild|clean-start`，再跑一次 audit 脚本就会给出 REUSE/REBUILD 计数。REBUILD 占多 → 缺陷在 `pi-codebuddy-sdk` 的会话同步；REUSE 占多 → 缺陷在上游或代理，pi 侧改不动。
+
 取舍：合并后侦察与规划不再互相独立复核。要换回两段式（侦察一个子代理、规划另一个）用 `/flow plan` 时传 `mode: "split"`，代价是两个冷前缀。
 
 ## 为什么是两阶段
