@@ -1,9 +1,23 @@
 // code-flow · APPLY stage
 // args: { plan: string, target?: string, verify?: string, maxRounds?: number, cwd?: string }
 //
-// Stage 3 implement (host-run gate) -> stage 4 parallel review -> stage 5 fix loop.
-// Every implement/fix child carries the verify command as a host-run gate, so
-// "ok" means the command actually passed, not that the child claimed success.
+// Stage 3 implement (host-run gate) -> stage 4 review -> stage 5 fix loop.
+//
+// Cache design: ONE reviewer session covers all three angles, and every
+// re-review resumes that same session.
+//
+// The old shape ran three parallel reviewers plus a fourth synthesis child.
+// That cost four cold prompt prefixes per round, and the synthesis child
+// re-sent all three review texts as fresh input tokens. The parallelism bought
+// no real independence: the three reviewers shared agent, model, system prompt
+// and the entire diff brief, and only the trailing "your angle:" line differed.
+// Meanwhile measured cache reads look like this (turn index -> hit rate):
+// turn 1 = 9.5%, turns 2-4 = 42%, 5-9 = 77%, 10-29 = 87%, 30+ = 91%.
+// Four children of two turns each sit entirely in the worst band.
+//
+// One longer reviewer session with three ordered passes stays in the 77-91%
+// band, and resuming it for round 2 means the reviewer re-checks its own
+// findings against a prefix that is already cached.
 
 const planText = typeof args.plan === "string" ? args.plan.trim() : "";
 if (!planText) {
@@ -18,6 +32,21 @@ const cwdField = scope ? { cwd: scope } : {};
 const gateField = verify ? { gate: verify } : {};
 
 const planBlock = ["Approved plan:", planText].join("\n");
+
+// Stable text first, varying text last: this keeps the cacheable prefix as long
+// as possible across rounds.
+const diffBrief = [
+  "Establish the change before judging it:",
+  "- `git status --short` for touched and new files",
+  "- `git diff` (also `git diff --cached` if anything is staged)",
+  "- read the surrounding code for every hunk",
+].join("\n");
+
+function verdictOf(result) {
+  const text = result && result.ok ? String(result.output || "") : "";
+  const match = text.match(/VERDICT:\s*(CLEAN|MUST_FIX)/i);
+  return match ? match[1].toUpperCase() : "UNKNOWN";
+}
 
 // --- stage 3: implement -----------------------------------------------------
 const impl = await runs.run("impl", {
@@ -42,90 +71,74 @@ if (!impl.ok) {
   };
 }
 
-// --- stages 4+5: review / fix loop -----------------------------------------
+// --- stage 4: one reviewer, three angles, one session -----------------------
+const reviewTask = [
+  "Review the implementation described below. You are the only reviewer on this",
+  "change, so cover all three angles in order, in this session, then synthesize.",
+  "",
+  planBlock,
+  "",
+  "Implementation summary:",
+  impl.output || "(no summary; inspect the working tree)",
+  "",
+  diffBrief,
+  "",
+  "Pass 1 — CORRECTNESS. Logic, edge cases, error paths, state, concurrency,",
+  "off-by-one, resource cleanup. For each finding name the input that produces",
+  "the wrong result.",
+  "",
+  "Pass 2 — VERIFICATION. Does the change prove itself? Missing tests, weak",
+  "assertions, commands that pass for the wrong reason. Say which command you",
+  "actually ran and what it printed.",
+  "",
+  "Pass 3 — BLAST RADIUS. Compatibility, migrations, config, security,",
+  "performance, repo conventions. Name the caller or artifact that breaks.",
+  "",
+  "Then synthesize: deduplicate across the three passes, drop taste-only notes,",
+  "keep every blocker and major finding. Number the must-fix list in priority",
+  "order as M1, M2, ... Report Findings / Verified / Not verified / Verdict.",
+].join("\n");
+
+let review = await runs.run("review-r1", {
+  agent: "cf-reviewer",
+  task: reviewTask,
+  output: ".pi/flow/review-r1.md",
+  ...cwdField,
+});
+
+let reviewRunId = review.ok ? review.runId : undefined;
 const rounds = [];
 let clean = false;
 let lastVerdict = "UNKNOWN";
 
 for (let round = 1; round <= maxRounds; round += 1) {
   const tag = "r" + round;
-  const diffHint = [
-    "Review the implementation described below. Read the real diff and surrounding code.",
-    "",
-    planBlock,
-    "",
-    "Implementation summary:",
-    impl.output || "(no summary; inspect the working tree)",
-  ].join("\n");
-
-  const reviews = await runs.all([
-    {
-      key: "review-correctness-" + tag,
-      agent: "cf-reviewer",
-      task:
-        diffHint +
-        "\n\nYour angle: CORRECTNESS. Logic, edge cases, error paths, state, concurrency, off-by-one.",
-      output: ".pi/flow/review-" + tag + "-correctness.md",
-      ...cwdField,
-    },
-    {
-      key: "review-tests-" + tag,
-      agent: "cf-reviewer",
-      task:
-        diffHint +
-        "\n\nYour angle: VERIFICATION. Does the change prove itself? Missing tests, weak assertions, commands that pass for the wrong reason.",
-      output: ".pi/flow/review-" + tag + "-tests.md",
-      ...cwdField,
-    },
-    {
-      key: "review-risk-" + tag,
-      agent: "cf-reviewer",
-      task:
-        diffHint +
-        "\n\nYour angle: BLAST RADIUS. Compatibility, migrations, config, security, performance, repo conventions.",
-      output: ".pi/flow/review-" + tag + "-risk.md",
-      ...cwdField,
-    },
-  ]);
-
-  const reviewText = reviews
-    .map((r, i) => "### Review " + (i + 1) + "\n" + (r.ok ? r.output : "(failed: " + (r.error || "unknown") + ")"))
-    .join("\n\n");
-
-  const synth = await runs.run("synth-" + tag, {
-    agent: "cf-reviewer",
-    task: [
-      "You are synthesizing three independent reviews of one change.",
-      "Merge them: deduplicate, drop taste-only notes, keep every blocker and major finding.",
-      "Number the must-fix list in priority order and give each an id (M1, M2, ...).",
-      "",
-      reviewText,
-      "",
-      "End with the required VERDICT line.",
-    ].join("\n"),
-    output: ".pi/flow/synth-" + tag + ".md",
-    ...cwdField,
-  });
-
-  const text = synth.ok ? String(synth.output || "") : "";
-  const match = text.match(/VERDICT:\s*(CLEAN|MUST_FIX)/i);
-  lastVerdict = match ? match[1].toUpperCase() : "UNKNOWN";
+  const text = review.ok ? String(review.output || "") : "";
+  lastVerdict = verdictOf(review);
   clean = lastVerdict === "CLEAN";
 
   const entry = {
     round,
     verdict: lastVerdict,
-    reviewOk: reviews.every(function (r) {
-      return r.ok;
-    }),
-    synthPath: ".pi/flow/synth-" + tag + ".md",
+    reviewOk: review.ok,
+    reviewPath: ".pi/flow/review-" + tag + ".md",
   };
   rounds.push(entry);
 
-  if (clean) break;
-  if (!synth.ok) {
-    return { ok: false, stage: "review", round, error: synth.error || "synthesis failed", rounds };
+  if (!review.ok) {
+    return { ok: false, stage: "review", round, error: review.error || "review failed", rounds };
   }
+  if (clean) break;
+  if (lastVerdict === "UNKNOWN") {
+    return {
+      ok: false,
+      stage: "review",
+      round,
+      error: "reviewer produced no VERDICT line; treat the review as unusable",
+      rounds,
+    };
+  }
+  if (round >= maxRounds) break;
 
   const fix = await runs.run("fix-" + tag, {
     agent: "cf-fixer",
@@ -134,7 +147,7 @@ for (let round = 1; round <= maxRounds; round += 1) {
       "",
       planBlock,
       "",
-      "Review synthesis:",
+      "Review:",
       text,
     ].join("\n"),
     output: ".pi/flow/fix-" + tag + ".md",
@@ -153,6 +166,49 @@ for (let round = 1; round <= maxRounds; round += 1) {
       rounds,
     };
   }
+
+  const nextTag = "r" + (round + 1);
+  const reReviewTask = [
+    "Re-review this change after a fix round. You reviewed it before; the fixer",
+    "applied the must-fix findings listed below and may have touched other lines.",
+    "",
+    diffBrief,
+    "",
+    "For every must-fix id, state fixed or not fixed and cite the file:line that",
+    "proves it. Then check the fix itself for regressions it introduced. Do not",
+    "re-litigate findings you already accepted or already rejected.",
+    "",
+    "Findings that were supposed to be fixed:",
+    text,
+  ].join("\n");
+
+  // Resume the same reviewer session: the diff brief, the plan and the earlier
+  // findings are already in its cached prefix. Fall back to a fresh child when
+  // the run id is gone (retention) or resume is rejected or fails.
+  let resumed;
+  try {
+    resumed = reviewRunId
+      ? await runs.run("review-" + nextTag, {
+          resume: reviewRunId,
+          task: reReviewTask,
+          output: ".pi/flow/review-" + nextTag + ".md",
+          ...cwdField,
+        })
+      : undefined;
+  } catch (error) {
+    resumed = undefined;
+  }
+
+  review = resumed && resumed.ok
+    ? resumed
+    : await runs.run("review-" + nextTag + "-fresh", {
+        agent: "cf-reviewer",
+        task: reReviewTask,
+        output: ".pi/flow/review-" + nextTag + ".md",
+        ...cwdField,
+      });
+
+  if (review.ok && review.runId) reviewRunId = review.runId;
 }
 
 return {
@@ -167,9 +223,9 @@ return {
     plan: ".pi/flow/plan.md",
     impl: ".pi/flow/impl.md",
     reviews: ".pi/flow/review-*.md",
-    synthesis: ".pi/flow/synth-*.md",
+    fixes: ".pi/flow/fix-*.md",
   },
   needsAttention: clean
     ? "Review passed. Inspect the diff, then commit yourself; this pipeline never commits."
-    : "Fix loop hit its cap with MUST_FIX outstanding. Read the last synthesis and decide.",
+    : "Fix loop hit its cap with MUST_FIX outstanding. Read the last review and decide.",
 };

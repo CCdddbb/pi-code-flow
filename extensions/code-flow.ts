@@ -10,12 +10,13 @@
  *   /flow plan <target>   recon + plan, stops for review
  *   /flow approve         accept the plan (gate 1) and unlock apply
  *   /flow reject [note]   discard the plan
- *   /flow apply           implement -> gate -> parallel review -> fix loop
+ *   /flow apply           implement -> gate -> single-session review -> fix loop
  *   /flow status          current phase, artifacts, verify command
+ *   /flow stats           prompt-cache hit rate for this project's sessions
  *   /flow reset           clear state for this project
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,6 +43,28 @@ interface FlowState {
 
 const EMPTY_STATE: FlowState = { phase: "idle", runs: [] };
 const STATUS_KEY = "code-flow";
+
+// Long prompt-cache retention. Children inherit this environment variable, and
+// the default short retention expires while a pipeline child is still working,
+// which turns the parent's next turn into a full-price re-send. Set once, before
+// any request; an explicit value from the operator always wins.
+if (!process.env.PI_CACHE_RETENTION) process.env.PI_CACHE_RETENTION = "long";
+
+interface SessionUsage {
+  input?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+}
+
+interface CacheStat {
+  turns: number;
+  prompt: number;
+  read: number;
+  write: number;
+  input: number;
+}
+
+const EMPTY_CACHE_STAT: CacheStat = { turns: 0, prompt: 0, read: 0, write: 0, input: 0 };
 
 function flowsDir(): string {
   try {
@@ -100,6 +123,107 @@ function detectVerify(cwd: string): string | undefined {
   if (existsSync(join(cwd, "pyproject.toml"))) return "pytest -q";
   if (existsSync(join(cwd, "Makefile"))) return "make check";
   return undefined;
+}
+
+function sessionsDir(cwd: string): string {
+  const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+  const key = "--" + cwd.replace(/^\/+/, "").replace(/[\\/]+/g, "-") + "--";
+  return join(agentDir, "sessions", key);
+}
+
+function pct(part: number, whole: number): string {
+  return whole > 0 ? ((part / whole) * 100).toFixed(1) + "%" : "-";
+}
+
+/**
+ * Cache read share of prompt tokens, the same ratio cc-switch and pi's footer
+ * show. Counted per assistant message so a session that mostly re-sends cached
+ * history scores high and a session made of cold starts scores low.
+ */
+function collectCacheStats(cwd: string): { files: { name: string; stat: CacheStat }[]; total: CacheStat } {
+  const dir = sessionsDir(cwd);
+  let names: string[] = [];
+  try {
+    names = readdirSync(dir).filter((name) => name.endsWith(".jsonl"));
+  } catch {
+    names = [];
+  }
+
+  const files: { name: string; stat: CacheStat }[] = [];
+  for (const name of names) {
+    const stat: CacheStat = { ...EMPTY_CACHE_STAT };
+    let raw = "";
+    try {
+      raw = readFileSync(join(dir, name), "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of raw.split("\n")) {
+      if (!line) continue;
+      let entry: { type?: string; message?: { role?: string; usage?: SessionUsage } };
+      try {
+        entry = JSON.parse(line) as typeof entry;
+      } catch {
+        continue;
+      }
+      const usage = entry.message?.usage;
+      if (entry.type !== "message" || entry.message?.role !== "assistant" || !usage) continue;
+      const prompt = (usage.input || 0) + (usage.cacheRead || 0) + (usage.cacheWrite || 0);
+      if (prompt <= 0) continue;
+      stat.turns += 1;
+      stat.prompt += prompt;
+      stat.read += usage.cacheRead || 0;
+      stat.write += usage.cacheWrite || 0;
+      stat.input += usage.input || 0;
+    }
+    if (stat.turns > 0) files.push({ name, stat });
+  }
+
+  const total = files.reduce<CacheStat>(
+    (acc, file) => ({
+      turns: acc.turns + file.stat.turns,
+      prompt: acc.prompt + file.stat.prompt,
+      read: acc.read + file.stat.read,
+      write: acc.write + file.stat.write,
+      input: acc.input + file.stat.input,
+    }),
+    { ...EMPTY_CACHE_STAT },
+  );
+
+  return { files, total };
+}
+
+function statsText(cwd: string): string {
+  const { files, total } = collectCacheStats(cwd);
+  if (files.length === 0) {
+    return [
+      "本项目还没有可统计的会话记录。",
+      sessionsDir(cwd),
+      "注意：子代理会话不写入这里，/flow stats 统计的是本项目主会话自身。",
+    ].join("\n");
+  }
+
+  const lines = [
+    `cache hit:      ${pct(total.read, total.prompt)}  (${total.read.toLocaleString()} / ${total.prompt.toLocaleString()} prompt tokens)`,
+    `uncached input: ${total.input.toLocaleString()}`,
+    `cache write:    ${total.write.toLocaleString()}`,
+    `turns:          ${total.turns.toLocaleString()}`,
+    "",
+    "最近会话：",
+  ];
+  for (const file of files.slice(-5).reverse()) {
+    const short = file.name.replace(/^.*_/, "").replace(/\.jsonl$/, "").slice(0, 8);
+    lines.push(
+      `  ${short}  ${String(file.stat.turns).padStart(4)} turns  hit ${pct(file.stat.read, file.stat.prompt).padStart(6)}`,
+    );
+  }
+  lines.push(
+    "",
+    "判读：命中率是会话长度的函数，不是提示词写法的函数。本机实测",
+    "第1轮 9.5% / 2-4轮 42% / 5-9轮 77% / 10-29轮 87% / 30+轮 91%。",
+    "短会话多、每个都从冷前缀开始，就是命中率低的主因。",
+  );
+  return lines.join("\n");
 }
 
 function statusText(state: FlowState): string {
@@ -166,7 +290,7 @@ function describe(cwd: string, state: FlowState): string {
   if (state.approvedAt) lines.push(`approved: ${state.approvedAt}`);
   if (state.rejectedAt) lines.push(`rejected: ${state.rejectedAt}`);
   if (state.note) lines.push(`note:     ${state.note}`);
-  for (const name of ["map.md", "plan.md", "impl.md", "synth-r1.md", "synth-r2.md"]) {
+  for (const name of ["map.md", "plan.md", "impl.md", "review-r1.md", "review-r2.md", "fix-r1.md"]) {
     const path = join(flowDir(cwd), name);
     if (existsSync(path)) lines.push(`artifact: ${path}`);
   }
@@ -180,9 +304,9 @@ function describe(cwd: string, state: FlowState): string {
 
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("flow", {
-    description: "Gated coding pipeline: /flow plan <目标> | approve | apply | status | reset",
+    description: "Gated coding pipeline: /flow plan <目标> | approve | apply | status | stats | reset",
     getArgumentCompletions(prefix: string) {
-      const words = ["plan", "approve", "reject", "apply", "status", "reset"];
+      const words = ["plan", "approve", "reject", "apply", "status", "stats", "reset"];
       const hits = words.filter((w) => w.startsWith(prefix.trim()));
       return hits.length ? hits.map((w) => ({ value: w, label: w })) : null;
     },
@@ -263,6 +387,11 @@ export default function (pi: ExtensionAPI) {
         setStatus(ctx, state);
         ctx.ui.notify(`执行中，gate = ${state.verify || "无（仅评审）"}`, "info");
         pi.sendUserMessage(applyPrompt(plan, state.target, state.verify, cwd));
+        return;
+      }
+
+      if (verb === "stats") {
+        ctx.ui.notify(statsText(cwd), "info");
         return;
       }
 
